@@ -42,7 +42,7 @@ name `PushMlopsImage`. This is a permissions policy, separate from the existing
 OIDC trust policy. The ECR repository must already exist.
 
 Run **Actions → AWS connection → Run workflow** on `main`. Each image receives
-a unique tag containing the commit SHA, run ID, and attempt number. Find the
+a unique tag containing the first 7 characters of the commit SHA, run ID, and attempt number. Find the
 complete image URI in the run summary. No `latest` tag is overwritten.
 
 The CUDA image can be built on the standard GitHub runner; GPU execution needs
