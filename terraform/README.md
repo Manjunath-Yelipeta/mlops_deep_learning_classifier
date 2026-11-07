@@ -22,12 +22,29 @@ using OpenID Connect (OIDC), and its second step verifies the assumed identity.
    | Secret | Value |
    | --- | --- |
    | `AWS_ROLE_ARN` | ARN of the IAM role created above |
-   | `AWS_REGION` | AWS region to use, such as `us-east-1` |
 
 4. Commit and push the workflow to the default branch. Open
    **Actions → AWS connection → Run workflow**, selecting a branch allowed
    by the role's trust policy.
 
-A successful run prints the assumed role's account and ARN. This workflow
-only checks authentication; it does not provision infrastructure. No long-lived
-AWS access keys are needed.
+A successful run verifies the assumed role, builds the root Dockerfile for
+`linux/amd64`, and pushes to
+`578257748163.dkr.ecr.us-east-1.amazonaws.com/mlops-deep-learning`.
+The region is fixed to `us-east-1` to match this repository; `AWS_REGION` is no
+longer required. No long-lived AWS access keys are needed.
+
+## Allow image pushes
+
+Before running, open **IAM → Roles → your GitHub role → Permissions → Add
+permissions → Create inline policy → JSON**. Paste
+[`ecr-push-policy.json`](ecr-push-policy.json), then create the policy with the
+name `PushMlopsImage`. This is a permissions policy, separate from the existing
+OIDC trust policy. The ECR repository must already exist.
+
+Run **Actions → AWS connection → Run workflow** on `main`. Each image receives
+a unique tag containing the commit SHA, run ID, and attempt number. Find the
+complete image URI in the run summary. No `latest` tag is overwritten.
+
+The CUDA image can be built on the standard GitHub runner; GPU execution needs
+a GPU-enabled host. The current container command keeps the container running
+and does not start training or an API.

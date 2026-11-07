@@ -8,9 +8,12 @@ permissions:
 
 jobs:
   connect-to-aws:
-    name: Connect to AWS
+    name: Build and push to ECR
     runs-on: ubuntu-26.04
-    timeout-minutes: 5
+    timeout-minutes: 60
+    env:
+      ECR_REGISTRY: 578257748163.dkr.ecr.us-east-1.amazonaws.com
+      ECR_REPOSITORY: mlops-deep-learning
     permissions:
       contents: read
       id-token: write
@@ -19,8 +22,35 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: us-east-1
           role-session-name: github-actions-${{ github.run_id }}
 
       - name: Verify AWS connection
         run: aws sts get-caller-identity
+
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Build Docker image
+        env:
+          IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          docker build --platform linux/amd64 --tag "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" .
+
+      - name: Log in to Amazon ECR
+        run: |
+          aws ecr get-login-password --region us-east-1 |
+            docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Push Docker image
+        env:
+          IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          echo "Image: \`$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log out of Amazon ECR
+        if: always()
+        run: docker logout "$ECR_REGISTRY"
