@@ -67,7 +67,7 @@ jobs:
     name: Launch EC2 GPU Runner
     runs-on: ubuntu-26.04
     needs: build-and-push-ecr-image
-    timeout-minutes: 20
+    timeout-minutes: 3
     permissions:
       contents: read
       id-token: write
