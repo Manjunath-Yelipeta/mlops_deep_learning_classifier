@@ -2,12 +2,40 @@ name: AWS connection
 
 on:
   workflow_dispatch:
+    inputs:
+      create_ec2:
+        description: Create a GPU training host after pushing the image
+        type: boolean
+        default: false
+      instance_type:
+        description: GPU instance type
+        type: choice
+        options:
+          - g4dn.xlarge
+          - g5.xlarge
+          - g5.2xlarge
+        default: g4dn.xlarge
+      subnet_id:
+        description: Subnet with outbound internet access (required for EC2)
+        type: string
+      security_group_id:
+        description: Security group in the subnet VPC (required for EC2)
+        type: string
+      instance_profile:
+        description: EC2 IAM instance profile name (required for EC2)
+        type: string
+      public_ip:
+        description: Assign public IP (public subnet needs an internet gateway route)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   connect-to-aws:
+    outputs:
+      image_uri: ${{ steps.image.outputs.uri }}
     name: Build and push to ECR
     runs-on: ubuntu-26.04
     timeout-minutes: 60
@@ -46,10 +74,44 @@ jobs:
             docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
       - name: Push Docker image
+        id: image
         run: |
           docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          echo "uri=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
           echo "Image: \`$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Log out of Amazon ECR
         if: always()
         run: docker logout "$ECR_REGISTRY"
+
+  create-training-host:
+    name: Create GPU training host
+    needs: connect-to-aws
+    if: ${{ inputs.create_ec2 }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Launch training host
+        env:
+          AWS_DEFAULT_REGION: us-east-1
+          IMAGE_URI: ${{ needs.connect-to-aws.outputs.image_uri }}
+          INSTANCE_TYPE: ${{ inputs.instance_type }}
+          SUBNET_ID: ${{ inputs.subnet_id }}
+          SECURITY_GROUP_ID: ${{ inputs.security_group_id }}
+          INSTANCE_PROFILE: ${{ inputs.instance_profile }}
+          PUBLIC_IP: ${{ inputs.public_ip }}
+        run: bash scripts/launch-training-host.sh
