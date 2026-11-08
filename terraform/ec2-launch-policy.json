@@ -3,21 +3,42 @@
   "Statement": [
     {
       "Effect": "Allow",
-      "Action": ["ec2:DescribeSubnets", "ec2:DescribeSecurityGroups", "ec2:DescribeImages", "ec2:DescribeInstances"],
+      "Action": [
+        "ec2:DescribeSubnets",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeImages",
+        "ec2:DescribeInstances",
+        "ec2:DescribeInstanceStatus"
+      ],
       "Resource": "*",
-      "Condition": {"StringEquals": {"aws:RequestedRegion": "us-east-1"}}
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "us-east-1"
+        }
+      }
     },
     {
       "Effect": "Allow",
       "Action": "ec2:RunInstances",
       "Resource": "*",
-      "Condition": {"StringEquals": {"aws:RequestedRegion": "us-east-1"}}
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "us-east-1"
+        }
+      }
     },
     {
       "Effect": "Allow",
       "Action": "ec2:CreateTags",
-      "Resource": ["arn:aws:ec2:us-east-1:578257748163:instance/*", "arn:aws:ec2:us-east-1:578257748163:volume/*"],
-      "Condition": {"StringEquals": {"ec2:CreateAction": "RunInstances"}}
+      "Resource": [
+        "arn:aws:ec2:us-east-1:578257748163:instance/*",
+        "arn:aws:ec2:us-east-1:578257748163:volume/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "ec2:CreateAction": "RunInstances"
+        }
+      }
     },
     {
       "Effect": "Allow",
@@ -26,9 +47,8 @@
     },
     {
       "Effect": "Allow",
-      "Action": "iam:PassRole",
-      "Resource": "arn:aws:iam::578257748163:role/mlops-training-host",
-      "Condition": {"StringEquals": {"iam:PassedToService": "ec2.amazonaws.com"}}
+      "Action": "ec2:TerminateInstances",
+      "Resource": "arn:aws:ec2:us-east-1:578257748163:instance/*"
     }
   ]
 }

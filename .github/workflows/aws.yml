@@ -2,40 +2,15 @@ name: AWS connection
 
 on:
   workflow_dispatch:
-    inputs:
-      create_ec2:
-        description: Create a GPU training host after pushing the image
-        type: boolean
-        default: false
-      instance_type:
-        description: GPU instance type
-        type: choice
-        options:
-          - g4dn.xlarge
-          - g5.xlarge
-          - g5.2xlarge
-        default: g4dn.xlarge
-      subnet_id:
-        description: Subnet with outbound internet access (required for EC2)
-        type: string
-      security_group_id:
-        description: Security group in the subnet VPC (required for EC2)
-        type: string
-      instance_profile:
-        description: EC2 IAM instance profile name (required for EC2)
-        type: string
-      public_ip:
-        description: Assign public IP (public subnet needs an internet gateway route)
-        type: boolean
-        default: false
 
 permissions:
   contents: read
 
 jobs:
-  connect-to-aws:
+  build-and-push-ecr-image:
     outputs:
       image_uri: ${{ steps.image.outputs.uri }}
+      commit_id: ${{ steps.commit.outputs.commit_id }}
     name: Build and push to ECR
     runs-on: ubuntu-26.04
     timeout-minutes: 60
@@ -62,7 +37,10 @@ jobs:
           persist-credentials: false
 
       - name: Set image tag
-        run: echo "IMAGE_TAG=${GITHUB_SHA:0:7}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+        id: commit
+        run: |
+          echo "IMAGE_TAG=${GITHUB_SHA:0:7}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+          echo "commit_id=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
       - name: Build Docker image
         run: |
@@ -84,10 +62,96 @@ jobs:
         if: always()
         run: docker logout "$ECR_REGISTRY"
 
-  create-training-host:
-    name: Create GPU training host
-    needs: connect-to-aws
-    if: ${{ inputs.create_ec2 }}
+  # JOB 2: Register a Spot GPU instance as a GitHub Actions runner.
+  launch-runner:
+    name: Launch EC2 GPU Runner
+    runs-on: ubuntu-26.04
+    needs: build-and-push-ecr-image
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      label: ${{ steps.start-ec2-runner.outputs.label }}
+      ec2-instance-id: ${{ steps.start-ec2-runner.outputs.ec2-instance-id }}
+      commit_id: ${{ needs.build-and-push-ecr-image.outputs.commit_id }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Resolve GPU AMI
+        id: ami
+        run: |
+          AMI_ID=$(aws ssm get-parameter --region us-east-1 \
+            --name /aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-26.04/latest/ami-id \
+            --query Parameter.Value --output text)
+          ROOT_DEVICE=$(aws ec2 describe-images --image-ids "$AMI_ID" --owners amazon \
+            --query 'Images[0].RootDeviceName' --output text)
+          test -n "$ROOT_DEVICE" && test "$ROOT_DEVICE" != None
+          echo "id=$AMI_ID" >> "$GITHUB_OUTPUT"
+          echo "root_device=$ROOT_DEVICE" >> "$GITHUB_OUTPUT"
+
+      - name: Start EC2 runner
+        id: start-ec2-runner
+        uses: machulav/ec2-github-runner@v2
+        with:
+          mode: start
+          github-token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          ec2-image-id: ${{ steps.ami.outputs.id }}
+          ec2-instance-type: g4dn.xlarge
+          subnet-id: ${{ secrets.AWS_SUBNET_ID_1 }}
+          security-group-id: ${{ secrets.AWS_SECURITY_GROUP_ID }}
+          market-type: spot
+          block-device-mappings: >-
+            [{"DeviceName":"${{ steps.ami.outputs.root_device }}","Ebs":{"VolumeSize":100,"VolumeType":"gp3","Encrypted":true,"DeleteOnTermination":true}}]
+          metadata-options: '{"HttpTokens":"required","HttpEndpoint":"enabled","HttpPutResponseHopLimit":1}'
+          aws-resource-tags: >-
+            [{"Key":"Name","Value":"mlops-gpu-runner"},{"Key":"GitHubRunId","Value":"${{ github.run_id }}"}]
+          pre-runner-script: |
+            set -euo pipefail
+            command -v git
+            systemctl enable --now docker
+            nvidia-smi
+            nvidia-ctk runtime configure --runtime=docker
+            systemctl restart docker
+
+  # Replace the CUDA check with your training command when the code is ready.
+  gpu-training:
+    name: Verify GPU training environment
+    needs: [build-and-push-ecr-image, launch-runner]
+    runs-on: ${{ needs.launch-runner.outputs.label }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      IMAGE_URI: ${{ needs.build-and-push-ecr-image.outputs.image_uri }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Pull training image and verify CUDA
+        run: |
+          aws ecr get-login-password --region us-east-1 |
+            docker login --username AWS --password-stdin 578257748163.dkr.ecr.us-east-1.amazonaws.com
+          docker pull "$IMAGE_URI"
+          docker run --rm --gpus all "$IMAGE_URI" \
+            python -c 'import torch; assert torch.cuda.is_available(), "CUDA unavailable"; print(torch.cuda.get_device_name(0))'
+
+      - name: Log out of ECR
+        if: always()
+        run: docker logout 578257748163.dkr.ecr.us-east-1.amazonaws.com
+
+  stop-runner:
+    name: Remove EC2 GPU Runner
+    needs: [launch-runner, gpu-training]
+    if: ${{ always() && needs.launch-runner.outputs.ec2-instance-id != '' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
@@ -100,18 +164,10 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: us-east-1
 
-      - name: Check out source
-        uses: actions/checkout@v6
+      - name: Stop EC2 runner
+        uses: machulav/ec2-github-runner@v2
         with:
-          persist-credentials: false
-
-      - name: Launch training host
-        env:
-          AWS_DEFAULT_REGION: us-east-1
-          IMAGE_URI: ${{ needs.connect-to-aws.outputs.image_uri }}
-          INSTANCE_TYPE: ${{ inputs.instance_type }}
-          SUBNET_ID: ${{ inputs.subnet_id }}
-          SECURITY_GROUP_ID: ${{ inputs.security_group_id }}
-          INSTANCE_PROFILE: ${{ inputs.instance_profile }}
-          PUBLIC_IP: ${{ inputs.public_ip }}
-        run: bash scripts/launch-training-host.sh
+          mode: stop
+          github-token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          label: ${{ needs.launch-runner.outputs.label }}
+          ec2-instance-id: ${{ needs.launch-runner.outputs.ec2-instance-id }}

@@ -47,68 +47,51 @@ The CUDA image can be built on the standard GitHub runner; GPU execution needs
 a GPU-enabled host. The current container command keeps the container running
 and does not start training or an API.
 
-## Optional GPU EC2 host (AWS CLI)
+## EC2 GPU GitHub Actions runner
 
-The workflow can launch one On-Demand GPU instance after the image push.
-It uses AWS CLI, with no Terraform state or resources created by Terraform.
-`create_ec2` defaults to false so image-only runs keep working.
+The workflow now follows the `machulav/ec2-github-runner` start/job/stop pattern:
 
-### One-time AWS setup
+1. `build-and-push-ecr-image` builds and publishes the image and short commit ID.
+2. `launch-runner` starts a Spot `g4dn.xlarge` and registers it with GitHub.
+3. `gpu-training` runs on its generated label, pulls the image, and verifies CUDA.
+   Replace that check with the training command once a training script is available.
+4. `stop-runner` deregisters the runner and terminates EC2 after the GPU job,
+   including failed jobs when the instance output is available.
 
-1. Create **IAM → Roles → Create role → AWS service → EC2** with role name
-   `mlops-training-host`. Attach these AWS-managed policies:
-   - `AmazonSSMManagedInstanceCore` for Session Manager access.
-   - `AmazonEC2ContainerRegistryReadOnly` for pulling the image.
-   Creating the role through the EC2 console wizard creates an instance profile;
-   use its **instance profile name**, normally `mlops-training-host`, in the workflow.
-   The role trusts EC2, whereas the GitHub role continues to trust GitHub OIDC.
-2. Give the GitHub role the permissions in
-   [`ec2-launch-policy.json`](ec2-launch-policy.json). You can create a customer-managed
-   policy and attach it, or use an inline policy. It permits launches in us-east-1
-   and passing only `mlops-training-host`. Update that role ARN if using another
-   role name. `AmazonEC2FullAccess` is a broader managed alternative for the EC2
-   actions, but does not replace the SSM parameter and `iam:PassRole` permissions.
-3. Choose an existing subnet and security group in the same VPC. No inbound rules
-   or SSH key pair are needed for Session Manager. Allow outbound HTTPS and DNS.
-   A private subnet needs NAT internet access. Alternatively use a public subnet
-   with an internet gateway route and enable the workflow's `public_ip` input.
-   The host needs access to ECR, S3 image layers, and Systems Manager endpoints.
-4. Ensure the account has enough **Running On-Demand G and VT instances** vCPU
-   quota (4 for g4dn.xlarge/g5.xlarge, 8 for g5.2xlarge) and capacity in the chosen AZ.
+All AWS authentication continues to use the existing OIDC role. No AWS access
+keys or EC2 instance profile are needed. Add these repository secrets:
 
-### Run and connect
+| Secret | Value |
+| --- | --- |
+| `PERSONAL_ACCESS_TOKEN` | Classic GitHub PAT with `repo` scope, as required by the runner action |
+| `AWS_SUBNET_ID_1` | Subnet in us-east-1 with internet access |
+| `AWS_SECURITY_GROUP_ID` | Security group in the same VPC; outbound HTTPS/DNS, no inbound rules required |
 
-Run **AWS connection** on `main`, enable `create_ec2`, and fill in `subnet_id`,
-`security_group_id`, and `instance_profile`. Choose `g4dn.xlarge` (default),
-`g5.xlarge`, or `g5.2xlarge`. The workflow resolves the latest Amazon x86_64
-Ubuntu 26.04 NVIDIA driver base AMI from the public SSM parameter and launches
-with a 100 GiB encrypted gp3 root disk and IMDSv2 required.
+The subnet must provide outbound connectivity to GitHub, AWS APIs and ECR.
+Use a private subnet with NAT, or a public subnet with auto-assign public IPv4
+and an internet gateway route. Ensure sufficient Spot G/VT vCPU quota and
+capacity. Spot interruptions can end training; save checkpoints externally.
 
-The run summary records the instance ID immediately after launch. The job waits
-for EC2's running state, **not for bootstrap completion**. Connect through
-**EC2 → Instances → Connect → Session Manager**, then check:
+Attach the EC2 permissions from [`ec2-launch-policy.json`](ec2-launch-policy.json)
+to the GitHub OIDC role (customer-managed or inline). `AmazonEC2FullAccess` is a
+broader managed alternative for EC2 permissions; the SSM `GetParameter` permission
+is still needed to resolve the AMI. The account's EC2 Spot service-linked role
+must exist before launching Spot instances; create it once through IAM or by
+requesting a Spot instance in the console.
 
-```bash
-sudo tail -f /var/log/training-host-bootstrap.log
-sudo test -f /var/lib/mlops-training-ready && echo Ready
-```
+The AMI is resolved from AWS's public Ubuntu 26.04 NVIDIA driver base parameter.
+The previously supplied `ami-01654480b8a1994bd` was not found in us-east-1.
+The disk is 100 GiB encrypted gp3. `pre-runner-script` enables Docker and the
+NVIDIA runtime. The current v2 action supports these Ubuntu/bootstrap and disk
+options; v2.3.9 does not expose all of them.
 
-Bootstrap configures the NVIDIA container runtime, pulls this run's image, and
-checks CUDA inside the container. It does not start training. Once ready, replace
-the example command with your own training entry point:
+Run **AWS connection → Run workflow** on `main`. Each run builds the image and
+starts a GPU runner. No training code exists yet, so the current GPU job only
+checks CUDA and then cleanup terminates the instance. Do not launch long-running
+training detached from this job: cleanup will terminate its host.
 
-```bash
-IMAGE_URI=$(sudo cat /etc/mlops-training-image)
-sudo docker run --rm --gpus all --shm-size=2g "$IMAGE_URI" python YOUR_TRAINING_SCRIPT.py
-```
-
-The repository currently contains no training script or dataset. Add those and
-mount data/output directories as needed. IMDS is available only on the host;
-containers are not given the host's IAM credentials by this setup.
-
-Each new workflow run creates a new billable host. Retries use the same client
-token; if the image or resolved AMI changed, AWS rejects the retry with an
-idempotency mismatch rather than creating a duplicate. Inspect the earlier
-instance before starting a new run. A workflow failure or cancellation does
-not terminate an instance already launched. Stop or terminate it in EC2 when
-finished; termination deletes its root disk, so save training outputs first.
+If startup fails before the action publishes its instance ID, or cleanup is
+interrupted, inspect EC2 for the `mlops-gpu-runner` Name and `GitHubRunId` tags
+and terminate any leftover instance. Check repository Settings → Actions →
+Runners for a stale registration. Cleanup deletes the root disk; persist results
+outside the runner before the GPU job completes.
